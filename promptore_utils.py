@@ -67,6 +67,7 @@ def evaluate_promptore(fewrel: pd.DataFrame, predicted_labels: torch.Tensor) -> 
 # Dataset
 ################################################################################
 import json
+from DATA.relations import relation_mapping
 
 def parse_fewrel(path: str, expand: bool = False) -> pd.DataFrame:
     """Parse fewrel dataset. Dataset can be downloaded at:
@@ -139,16 +140,84 @@ def parse_wikiphi3(path: str, expand: bool = False) -> pd.DataFrame:
     return wikiphi3[::20]
     
 
+def parse_labelstudio(path: str, expand: bool = False) -> pd.DataFrame:
+    
+    file_path = path# "DATA/project-6-at-2025-04-22-13-14-67864b63.json"
+    with open(file_path, "r", encoding="utf-8") as file:
+        dataset = json.load(file)
+        
+    ls_tuples = []    
+    for entry in dataset:
+        # print(entry)
+        annotations = entry.get("annotations", [])
+        data = entry.get("data", [])
+
+        
+        for annotation in annotations:
+            entities = {e["id"]: e["value"]["text"] for e in annotation.get("result", []) if e["type"] == "labels"}
+            # entity_types_mapping = {e["id"]: e["value"]["labels"] for e in annotation.get("result", []) if e["type"] == "labels"}
+            relations = [r for r in annotation.get("result", []) if r["type"] == "relation"]
+            
+            for relation in relations:
+                from_id = relation["from_id"]
+                to_id = relation["to_id"]
+                direction = relation["direction"] # Add ht according to direction
+                
+                relation_type = relation.get("labels", [""])[0]  # Extract first label or empty string
+                if relation_type == "":
+                    relation_type = "0"
+                    
+                from_node_t = entities.get(from_id, "")
+                to_node_t = entities.get(to_id, "")
+                
+                relation_name = relation_mapping.get(int(relation_type), "")
+                
+                bi = False
+                
+                if direction == "right":
+                    from_node = from_node_t
+                    to_node = to_node_t
+                elif direction == "left":
+                    from_node = to_node_t
+                    to_node = from_node_t
+                else:
+                    bi = True
+                    from_node = from_node_t
+                    to_node = to_node_t
+                
+                ls_tuples.append({
+                        'sent': data["sentence"],
+                        'r': relation_name,
+                        'e1': from_node,
+                        'e2': to_node,
+                        'paper_id': data["paper_id"],
+                        'sentence_id': data["sentence_id"]
+                    })
+                
+                if bi:
+                    ls_tuples.append({
+                        'sent': data["sentence"],
+                        'r': relation_name,
+                        'e1': to_node,
+                        'e2': from_node,
+                        'paper_id': data["paper_id"],
+                        'sentence_id': data["sentence_id"]
+                    })
+                
+    
+    return pd.DataFrame(ls_tuples)
+
 ################################################################################
 # PromptORE
 ################################################################################
 
 from torch.utils.data import TensorDataset, DataLoader
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer, BertModel, BertForMaskedLM
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.cluster import KMeans
 from yellowbrick.cluster import KElbowVisualizer
 from tqdm.auto import tqdm
+import pickle
 
 def to_device(data, device):
     """Move data to device
@@ -209,7 +278,7 @@ def tokenize(tokenizer, text: str, max_len: int) -> tuple:
 
 
 def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
-    template: str = '{e1} [MASK] {e2}.', max_len=128, device: str = 'cuda', data = "wikiphi3") -> pd.DataFrame:
+    template: str = '{e1} [MASK] {e2}.', max_len=128, device: str = 'cuda', data = "ls", emb = 2) -> pd.DataFrame:
     """Compute PromptORE relation embedding for the dataframe
 
     Args:
@@ -227,9 +296,12 @@ def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
     tokenizer = BertTokenizer.from_pretrained(
         'P0L3/clirebert_clirevocab_uncased', do_lower_case=True)
     mask_id = tokenizer.mask_token_id
-
-    bert = BertModel.from_pretrained(
-        'P0L3/clirebert_clirevocab_uncased', output_attentions=False)
+    if emb == 1:
+        bert = BertModel.from_pretrained(
+            'P0L3/clirebert_clirevocab_uncased', output_attentions=False)
+    elif emb == 2:
+        bert = BertForMaskedLM.from_pretrained(
+            'P0L3/clirebert_clirevocab_uncased', output_attentions=False)
 
     # Tokenize fewrel
     rows = []
@@ -240,7 +312,7 @@ def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
             tail = ' '.join(tokens[instance['t_start']:instance['t_end']+1])
 
             sent = ' '.join(tokens)
-        elif data == "wikiphi3":
+        elif data in ["wikiphi3", "ls"]:
             head = instance["e1"]
             tail = instance["e2"]
             sent = instance["sent"]
@@ -261,7 +333,6 @@ def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
             })
         except ValueError:
             print(instance)
-            sum("babo")
         # print(len(input_ids))
 
     complete_fewrel = pd.DataFrame(rows)
@@ -278,23 +349,68 @@ def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
     masks = torch.Tensor(complete_fewrel['input_mask'].tolist()).long()
     dataset = TensorDataset(tokens, attention_mask, masks)
     dataloader = DataLoader(dataset, num_workers=1,
-                            batch_size=256, shuffle=False)
+                            batch_size=24, shuffle=False)
+    if emb == 1: # Original embeddings from PromptORE paper
+        with torch.no_grad():
+            embeddings = []
+            for batch in tqdm(dataloader):
+                tokens, attention_mask, mask = batch
+                tokens = tokens.to(device)
+                attention_mask = attention_mask.to(device)
+                out = bert(tokens, attention_mask)[0].detach()     
+                arange = torch.arange(out.shape[0])
+                embedding = out[arange, mask]
+                
+                embeddings.append(embedding)
+                del out
+            embeddings = torch.cat(embeddings, dim=0).detach().to('cpu')
+            embeddings_list = list(embeddings)
+            with open("embeddings_mask_only_sms.pkl", "wb") as f:
+                pickle.dump(embeddings_list[:10], f)
+    elif emb == 2: # First N embeddings concatenated
+        TOP_N = 1
+        with torch.no_grad():
+            embeddings = []
 
-    with torch.no_grad():
-        embeddings = []
-        for batch in tqdm(dataloader):
-            tokens, attention_mask, mask = batch
-            tokens = tokens.to(device)
-            attention_mask = attention_mask.to(device)
+            for batch in tqdm(dataloader):
+                tokens, attention_mask, mask = batch
+                tokens = tokens.to(device)
+                attention_mask = attention_mask.to(device)
+                mask = mask.to(device)
 
-            out = bert(tokens, attention_mask)[0].detach()
+                # Step 1: Get logits and top-N predictions at [MASK] position
+                output = bert(input_ids=tokens, attention_mask=attention_mask)
+                logits = output.logits  # [batch_size, seq_len, vocab_size]
+                vocab_probs = torch.softmax(logits, dim=-1)
 
-            arange = torch.arange(out.shape[0])
-            embedding = out[arange, mask]
-            embeddings.append(embedding)
-            del out
-        embeddings = torch.cat(embeddings, dim=0).detach().to('cpu')
-        embeddings_list = list(embeddings)
+                # Collect top-N token IDs for each input
+                batch_size = tokens.size(0)
+                top_embeddings = []
+
+                for i in range(batch_size):
+                    mask_pos = mask[i].item()  # position of [MASK] in this sequence
+                    top_n_tokens = torch.topk(vocab_probs[i, mask_pos], k=TOP_N).indices  # [TOP_N]
+
+                    concat_embedding = []
+                    for token_id in top_n_tokens:
+                        modified_input = tokens[i].clone()
+                        modified_input[mask_pos] = token_id  # Replace [MASK] with predicted token
+
+                        # Forward pass again on modified input
+                        out_mod = bert(input_ids=modified_input.unsqueeze(0), attention_mask=attention_mask[i].unsqueeze(0), output_hidden_states=True).hidden_states[-1]
+                        concat_embedding.append(out_mod[0, mask_pos])  # Embedding at replaced token position
+
+                    # Concatenate top-N embeddings
+                    final_embed = torch.cat(concat_embedding, dim=-1)  # shape: [TOP_N * hidden_dim]
+                    top_embeddings.append(final_embed)
+
+                batch_embed = torch.stack(top_embeddings, dim=0)
+                embeddings.append(batch_embed)
+
+            embeddings = torch.cat(embeddings, dim=0).detach().to('cpu')
+            embeddings_list = list(embeddings)
+            with open("embeddings_topk1_sms.pkl", "wb") as f:
+                pickle.dump(embeddings_list[:10], f)
 
     bert.to('cpu')
     complete_fewrel['embedding'] = embeddings_list
