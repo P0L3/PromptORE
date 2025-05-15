@@ -218,6 +218,8 @@ from sklearn.cluster import KMeans
 from yellowbrick.cluster import KElbowVisualizer
 from tqdm.auto import tqdm
 import pickle
+import ADDLIB.RelationEmbeddings.src.main.python.relcore.pre_trained_encoders.relation_encoder as relation_enc
+
 
 def to_device(data, device):
     """Move data to device
@@ -278,7 +280,7 @@ def tokenize(tokenizer, text: str, max_len: int) -> tuple:
 
 
 def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
-    template: str = '{e1} [MASK] {e2}.', max_len=128, device: str = 'cuda', data = "ls", emb = 2) -> pd.DataFrame:
+    template: str = '{e1} [MASK] {e2}.', max_len=128, device: str = 'cuda', data = "ls", emb = 1) -> pd.DataFrame:
     """Compute PromptORE relation embedding for the dataframe
 
     Args:
@@ -293,13 +295,33 @@ def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
     """
     fewrel = fewrel.copy()
     # Setup tokenizer + bert
-    tokenizer = BertTokenizer.from_pretrained(
-        'P0L3/clirebert_clirevocab_uncased', do_lower_case=True)
-    mask_id = tokenizer.mask_token_id
+    ## TOKENIZER
+    if emb in [1, 5]:
+        tokenizer = BertTokenizer.from_pretrained(
+            'P0L3/clirebert_clirevocab_uncased', do_lower_case=True)
+        mask_id = tokenizer.mask_token_id
+
+        
+    ## MODEL
     if emb == 1:
         bert = BertModel.from_pretrained(
             'P0L3/clirebert_clirevocab_uncased', output_attentions=False)
-    elif emb == 2:
+    elif emb in [2, 3, 4]:
+        """
+        bert_model.start_of_head_entity,
+        bert_model.end_of_head_entity,
+        bert_model.start_of_tail_entity,
+        bert_model.end_of_tail_entity,
+        bert_model.mask_token,
+        """
+        bert = relation_enc.RelationEncoder.from_pretrained("fmmka/rel-emb-bert-b-uncased")
+        tokenizer = bert.tokenizer
+        
+        e1 = bert.start_of_head_entity
+        e2 = bert.start_of_tail_entity
+        mask = bert.mask_token
+        
+    elif emb == 5:
         bert = BertForMaskedLM.from_pretrained(
             'P0L3/clirebert_clirevocab_uncased', output_attentions=False)
 
@@ -367,7 +389,61 @@ def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
             embeddings_list = list(embeddings)
             with open("embeddings_mask_only_sms.pkl", "wb") as f:
                 pickle.dump(embeddings_list[:10], f)
-    elif emb == 2: # First N embeddings concatenated
+    elif emb == 2:  # E1 embeddings
+        with torch.no_grad():
+            embeddings = []
+            for batch in tqdm(dataloader):
+                tokens, attention_mask, e1 = batch
+                tokens = tokens.to(device)
+                attention_mask = attention_mask.to(device)
+                out = bert(tokens, attention_mask)[0].detach()
+                arange = torch.arange(out.shape[0])
+                embedding = out[arange, e1]
+                embeddings.append(embedding)
+                del out
+            embeddings = torch.cat(embeddings, dim=0).detach().to('cpu')
+            embeddings_list = list(embeddings)
+            with open("embeddings_e1_only_sms.pkl", "wb") as f:
+                pickle.dump(embeddings_list[:10], f)
+
+    elif emb == 3:  # E2 embeddings
+        with torch.no_grad():
+            embeddings = []
+            for batch in tqdm(dataloader):
+                tokens, attention_mask, _, e2 = batch
+                tokens = tokens.to(device)
+                attention_mask = attention_mask.to(device)
+                out = bert(tokens, attention_mask)[0].detach()
+                arange = torch.arange(out.shape[0])
+                embedding = out[arange, e2]
+                embeddings.append(embedding)
+                del out
+            embeddings = torch.cat(embeddings, dim=0).detach().to('cpu')
+            embeddings_list = list(embeddings)
+            with open("embeddings_e2_only_sms.pkl", "wb") as f:
+                pickle.dump(embeddings_list[:10], f)
+
+    elif emb == 4:  # Concatenate E1, E2, and MASK embeddings
+        with torch.no_grad():
+            embeddings = []
+            for batch in tqdm(dataloader):
+                tokens, attention_mask, mask, e1, e2 = batch
+                tokens = tokens.to(device)
+                attention_mask = attention_mask.to(device)
+                out = bert(tokens, attention_mask)[0].detach()
+                arange = torch.arange(out.shape[0])
+                e1_emb = out[arange, e1]
+                e2_emb = out[arange, e2]
+                mask_emb = out[arange, mask]
+                combined = torch.cat([e1_emb, e2_emb, mask_emb], dim=1)
+                embeddings.append(combined)
+                del out
+            embeddings = torch.cat(embeddings, dim=0).detach().to('cpu')
+            embeddings_list = list(embeddings)
+            with open("embeddings_e1_e2_mask_concat_sms.pkl", "wb") as f:
+                pickle.dump(embeddings_list[:10], f)            
+    
+    elif emb == 5: # First N embeddings concatenated
         TOP_N = 1
         with torch.no_grad():
             embeddings = []
