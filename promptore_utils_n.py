@@ -68,6 +68,7 @@ def evaluate_promptore(fewrel: pd.DataFrame, predicted_labels: torch.Tensor) -> 
 ################################################################################
 import json
 from DATA.relations import relation_mapping
+import re
 
 def parse_fewrel(path: str, expand: bool = False) -> pd.DataFrame:
     """Parse fewrel dataset. Dataset can be downloaded at:
@@ -139,6 +140,81 @@ def parse_wikiphi3(path: str, expand: bool = False) -> pd.DataFrame:
 
     return wikiphi3[::20]
     
+def process_row(row, 
+                e1_start_marker: str, 
+                e1_end_marker: str, 
+                e2_start_marker: str, 
+                e2_end_marker: str, 
+                mask_token: str,
+                r = False):
+    
+    sent, e1, e2 = row["sent"], str(row["e1"]), str(row["e2"])
+    
+        
+
+    # Tag entities with provided markers
+    sent_t = re.sub(re.escape(e1), f"{e1_start_marker}{e1}{e1_end_marker}", sent)
+    sent_t1 = re.sub(re.escape(e2), f"{e2_start_marker}{e2}{e2_end_marker}", sent_t)
+
+    # Append relation question with mask token
+    sent_t2 = f"{sent_t1} The relation between {e1} and {e2} is {mask_token}."
+    
+    if r:
+        sent_t2 = e1 + " " + row["r"] + " " + e2 + "." + sent_t2
+        
+    return sent_t2
+
+def parse_wikiphi3_with_dynamic_markers(
+    path: str, 
+    e1_start_marker: str, 
+    e1_end_marker: str, 
+    e2_start_marker: str, 
+    e2_end_marker: str, 
+    mask_token: str,
+    expand: bool = False) -> pd.DataFrame:
+    """
+    0   sentence       
+    1   source_name    
+    2   relation_name  
+    3   target_name    
+    4   triple                     
+    """
+    # Load data
+    wikiphi3 = pd.read_pickle(path)
+    print("Data len: ", len(wikiphi3))
+    
+    # Fix column naming
+    wikiphi3.rename(columns={
+        "sentence": "sent"}, inplace=True)
+    
+    # Add e1 and e2
+    def triple_entity_extract(triple):
+        return triple[0], triple[1], triple[2]
+    
+    wikiphi3[["e1", "r", "e2"]] = wikiphi3.apply(lambda x: pd.Series(triple_entity_extract(x["triple"])), axis=1)
+    wikiphi3.fillna("", inplace=True)
+    
+    # Remove outlayers
+    
+    q = wikiphi3["sent"].apply(len).quantile(q=0.999)
+    wikiphi3 = wikiphi3[wikiphi3["sent"].apply(len) <= q]
+    
+    print("Data len final: ", len(wikiphi3))
+    
+    wikiphi3["sent"] = wikiphi3.apply(
+        lambda row: process_row(
+            row,
+            e1_start_marker, e1_end_marker,
+            e2_start_marker, e2_end_marker,
+            mask_token, True
+        ),
+        axis=1
+    )
+
+    return wikiphi3[::10]
+
+
+
 
 def parse_labelstudio(path: str, expand: bool = False) -> pd.DataFrame:
     
@@ -425,7 +501,7 @@ def compute_promptore_relation_embedding(fewrel: pd.DataFrame, \
         e1_marker_str_for_template_formatting = model_specific_e1_marker
         e2_marker_str_for_template_formatting = model_specific_e2_marker
         
-        if data == "ls":
+        if data in ["ls", "wikiphi3"]:
             # Your parse_labelstudio uses hardcoded "[E1]", "[E2]", "[MASK]" (ignoring spaces for token ID lookup for now)
             # We must find the token IDs of THESE strings using the FMMKA tokenizer.
             ls_hardcoded_e1_marker = "[E1]" # From your parse_labelstudio
